@@ -211,7 +211,7 @@ def fetch_option_chain(symbol, cfg, expiry_req):
     events = track_changes((symbol, expiry), rows, cfg["min_abs"])
     return {
         "symbol": symbol, "name": cfg["name"], "step": cfg["step"],
-        "expiry": expiry, "expiries": expiries[:6],
+        "expiry": expiry, "expiries": expiries[:12],
         "spot": spot, "pcr": pcr, "max_pain": pain_strike,
         "support": max(rows, key=lambda x: x["pe_oi"])["strike"],
         "resistance": max(rows, key=lambda x: x["ce_oi"])["strike"],
@@ -304,6 +304,8 @@ PAGE = """
 let symbol="NIFTY", expiry="", step=50, interval="5", oiRows=[], showOI=true, mode="tot",
     candles=[], lastD=null, lastDay=[], needFit=false, lines=[];
 const errs={c:'',o:''};
+function savedExp(){try{return localStorage.getItem('exp_'+symbol)||''}catch(e){return ''}}
+expiry=savedExp();  // remember the expiry you picked (falls back to nearest if it has expired)
 const box=document.getElementById('chart');
 const chart=LightweightCharts.createChart(box,{
  layout:{background:{color:'#0f1115'},textColor:'#cbd5e1'},
@@ -482,11 +484,14 @@ async function loadOI(){
 }
 
 document.getElementById('symSel').onchange=e=>{
- symbol=e.target.value;expiry='';oiRows=[];lastD=null;lastDay=[];candles=[];
+ symbol=e.target.value;expiry=savedExp();oiRows=[];lastD=null;lastDay=[];candles=[];
  lines.forEach(l=>{try{candle.removePriceLine(l)}catch(x){}});lines=[];
  document.getElementById('alerts').textContent='Loading...';
  needFit=true;loadCandles();loadOI();};
-document.getElementById('expSel').onchange=e=>{expiry=e.target.value;loadOI();};
+document.getElementById('expSel').onchange=e=>{
+ expiry=e.target.value;
+ try{localStorage.setItem('exp_'+symbol,expiry)}catch(x){}
+ loadOI();};
 document.getElementById('oiBtn').onclick=e=>{showOI=!showOI;e.target.classList.toggle('on',showOI);};
 document.getElementById('modeBtn').onclick=e=>{
  mode=mode==='tot'?'chg':'tot';
