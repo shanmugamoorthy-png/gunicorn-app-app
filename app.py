@@ -276,7 +276,7 @@ const pc=(a,b)=>b?(a-b)/b*100:0;
 function legend(){
  document.getElementById('legend').textContent = mode==='tot'
   ? 'OI profile (total): red = Call OI, green = Put OI. Label = strike and % change vs previous day.'
-  : 'OI change profile (vs prev day): filled bar = OI added, outlined bar = OI unwound. Red = Calls, green = Puts.';
+  : 'OI change profile (vs prev day): filled bar = OI added, outlined bar = OI unwound. Red = Calls, green = Puts. Labels: strike, side and % (minus = unwinding).';
 }
 legend();
 
@@ -306,7 +306,19 @@ function draw(){
    const cw=Math.abs(cv_)/mx*maxW,pw=Math.abs(pv_)/mx*maxW;
    bar(right-cw,y-bh,cw,bh,cv_,'rgba(239,68,68,');
    bar(right-pw,y,pw,bh,pv_,'rgba(34,197,94,');
-   if(top.includes(r.strike)){
+   if(mode==='chg'){
+    // label every bar with its % change, so unwinding (negative %) is visible too
+    if(Math.abs(y-y2)>=18){
+     ctx.font='10px system-ui';ctx.textAlign='right';
+     for(const [side,wd,n,p0,yy,col] of [['CE',cw,r.ce_oi,r.ce_prev,y-bh/2,'#fca5a5'],['PE',pw,r.pe_oi,r.pe_prev,y+bh/2,'#86efac']]){
+      const p=pc(n,p0);
+      if(wd<2||Math.abs(p)<10)continue;
+      ctx.fillStyle=col;
+      ctx.fillText(`${r.strike} ${side} ${p>=0?'+':''}${p.toFixed(0)}%`,right-wd-4,yy);
+     }
+     ctx.font='11px system-ui';
+    }
+   }else if(top.includes(r.strike)){
     const ceBig=Math.abs(cv_)>=Math.abs(pv_);
     const p=ceBig?pc(r.ce_oi,r.ce_prev):pc(r.pe_oi,r.pe_prev);
     const wd=ceBig?cw:pw;
