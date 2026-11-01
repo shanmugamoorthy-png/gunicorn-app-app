@@ -1,5 +1,7 @@
 import os
+import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -15,6 +17,14 @@ IST = timezone(timedelta(hours=5, minutes=30))
 NIFTY_ID = "13"  # NIFTY 50 index security id
 SEGMENT = "IDX_I"
 
+# OI change tracking (in memory)
+MIN_PCT = 2.0        # log a change only if >= 2% vs baseline
+MIN_ABS = 20000      # and at least this many contracts
+BASE_AGE = 300       # compare against snapshot ~5 min old
+_hist = deque()      # (timestamp, {strike: (ce_oi, pe_oi)})
+_events = []
+_last_logged = {}
+_lock = threading.Lock()
 _cache = {}
 
 
@@ -35,15 +45,6 @@ def cached(key, ttl, fn):
     val = fn()
     _cache[key] = (now, val)
     return val
-
-
-def ema(values, period):
-    k = 2 / (period + 1)
-    out, prev = [], None
-    for v in values:
-        prev = v if prev is None else v * k + prev * (1 - k)
-        out.append(prev)
-    return out
 
 
 def fetch_candles(interval, days):
@@ -72,34 +73,62 @@ def fetch_candles(interval, days):
     r.raise_for_status()
     d = r.json()
     ts = d.get("timestamp", [])
-    candles = []
-    cum_pv = cum_v = 0.0
-    last_day = None
+    out = []
     for i, t in enumerate(ts):
-        o, h, l, c = d["open"][i], d["high"][i], d["low"][i], d["close"][i]
-        v = d["volume"][i] if d.get("volume") else 0
-        day = datetime.fromtimestamp(t, IST).date()
-        if day != last_day:  # VWAP resets daily
-            cum_pv = cum_v = 0.0
-            last_day = day
-        tp = (h + l + c) / 3
-        cum_pv += tp * v
-        cum_v += v
-        vwap = cum_pv / cum_v if cum_v else c
-        candles.append(
+        out.append(
             {
-                # lightweight-charts shows UTC, so shift to IST
-                "time": int(t) + 19800,
-                "open": o, "high": h, "low": l, "close": c,
-                "volume": v, "vwap": round(vwap, 2),
+                "time": int(t) + 19800,  # chart shows UTC, shift to IST
+                "open": d["open"][i],
+                "high": d["high"][i],
+                "low": d["low"][i],
+                "close": d["close"][i],
+                "volume": d["volume"][i] if d.get("volume") else 0,
             }
         )
-    closes = [c["close"] for c in candles]
-    e20, e50 = ema(closes, 20), ema(closes, 50)
-    for i, c in enumerate(candles):
-        c["ema20"] = round(e20[i], 2)
-        c["ema50"] = round(e50[i], 2)
-    return candles
+    return out
+
+
+def track_changes(rows):
+    """Compare current OI with a ~5 min old snapshot and log big adds/unwinds."""
+    now = time.time()
+    cur = {r["strike"]: (r["ce_oi"], r["pe_oi"]) for r in rows}
+    with _lock:
+        base = None
+        for t, snap in _hist:
+            if now - t >= BASE_AGE:
+                base = snap  # keep the newest snapshot that is old enough
+        if base:
+            stamp = datetime.now(IST).strftime("%H:%M")
+            for strike, (ce, pe) in cur.items():
+                if strike not in base:
+                    continue
+                for side, new, old in (("CE", ce, base[strike][0]), ("PE", pe, base[strike][1])):
+                    if old <= 0:
+                        continue
+                    delta = new - old
+                    pct = delta / old * 100
+                    if abs(delta) < MIN_ABS or abs(pct) < MIN_PCT:
+                        continue
+                    key = (strike, side)
+                    if now - _last_logged.get(key, 0) < BASE_AGE:
+                        continue
+                    _last_logged[key] = now
+                    _events.insert(
+                        0,
+                        {
+                            "time": stamp,
+                            "strike": strike,
+                            "side": side,
+                            "type": "add" if delta > 0 else "unwind",
+                            "delta": delta,
+                            "pct": round(pct, 1),
+                        },
+                    )
+            del _events[80:]
+        _hist.append((now, cur))
+        while _hist and now - _hist[0][0] > 900:
+            _hist.popleft()
+        return list(_events)
 
 
 def fetch_option_chain():
@@ -132,13 +161,12 @@ def fetch_option_chain():
         )
     rows.sort(key=lambda x: x["strike"])
     atm = min(rows, key=lambda x: abs(x["strike"] - spot))["strike"]
-    rows = [x for x in rows if abs(x["strike"] - atm) <= 1000]  # +-20 strikes
+    rows = [x for x in rows if abs(x["strike"] - atm) <= 1000]
 
     tot_ce = sum(x["ce_oi"] for x in rows)
     tot_pe = sum(x["pe_oi"] for x in rows)
     pcr = round(tot_pe / tot_ce, 2) if tot_ce else 0
 
-    # max pain
     best, pain_strike = None, None
     for s in rows:
         pain = sum(max(0, s["strike"] - x["strike"]) * x["ce_oi"] +
@@ -146,11 +174,13 @@ def fetch_option_chain():
         if best is None or pain < best:
             best, pain_strike = pain, s["strike"]
 
+    events = track_changes(rows)
     return {
         "expiry": expiry, "spot": spot, "pcr": pcr, "max_pain": pain_strike,
         "support": max(rows, key=lambda x: x["pe_oi"])["strike"],
         "resistance": max(rows, key=lambda x: x["ce_oi"])["strike"],
         "rows": rows,
+        "events": events,
     }
 
 
@@ -159,8 +189,7 @@ def api_candles():
     interval = request.args.get("interval", "5")
     days = int(request.args.get("days", 5))
     try:
-        data = cached(("c", interval, days), 15, lambda: fetch_candles(interval, days))
-        return jsonify(data)
+        return jsonify(cached(("c", interval, days), 15, lambda: fetch_candles(interval, days)))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -182,49 +211,93 @@ PAGE = """
 <!doctype html>
 <html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Nifty Advanced Chart</title>
+<title>Nifty OI Profile</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
  body{margin:0;background:#0f1115;color:#e6e6e6;font-family:system-ui,sans-serif}
  header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid #222}
  button{background:#1b1f27;color:#ddd;border:1px solid #333;padding:6px 12px;border-radius:6px}
  button.on{background:#4f46e5;border-color:#4f46e5}
- #chart{height:60vh;min-height:340px}
+ #wrap{position:relative;height:62vh;min-height:360px}
+ #chart{position:absolute;inset:0}
+ #ov{position:absolute;left:0;top:0;pointer-events:none;z-index:3}
  .stats{display:flex;flex-wrap:wrap;gap:10px;padding:10px 14px}
  .card{background:#161a21;border:1px solid #262b35;border-radius:8px;padding:8px 12px}
  .card b{display:block;font-size:18px}
  .card span{font-size:12px;color:#8b93a1}
- .oi{padding:0 14px 20px;height:320px}
+ .legend{font-size:12px;color:#8b93a1;padding:4px 14px}
  #err{color:#f87171;padding:6px 14px}
- .legend{font-size:12px;color:#8b93a1;padding:0 14px}
+ .tables{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;padding:6px 14px 24px}
+ .tbl{background:#161a21;border:1px solid #262b35;border-radius:8px;padding:8px 10px}
+ .tbl h3{margin:2px 0 8px;font-size:15px}
+ table{width:100%;border-collapse:collapse;font-size:13px}
+ th{color:#8b93a1;font-weight:500;text-align:left;padding:4px 3px}
+ td{padding:5px 3px;border-top:1px solid #222}
+ .ce{color:#f87171}.pe{color:#4ade80}.dim{color:#8b93a1}
 </style></head><body>
 <header>
  <strong>NIFTY 50</strong>
  <span id="px"></span>
  <span style="flex:1"></span>
+ <button id="oiBtn" class="on">OI Profile</button>
  <button data-i="1">1m</button><button data-i="5" class="on">5m</button>
  <button data-i="15">15m</button><button data-i="60">1h</button><button data-i="D">1D</button>
 </header>
 <div id="err"></div>
-<div id="chart"></div>
-<div class="legend">Yellow = VWAP, Blue = EMA20, Orange = EMA50</div>
+<div id="wrap"><div id="chart"></div><canvas id="ov"></canvas></div>
+<div class="legend">OI profile: red = Call OI, green = Put OI. Label = strike and % change vs previous day.</div>
 <div class="stats" id="stats"></div>
-<div class="oi"><canvas id="oiChart"></canvas></div>
+<div class="tables">
+ <div class="tbl"><h3 class="pe">OI Addition</h3><table id="addT"></table></div>
+ <div class="tbl"><h3 class="ce">OI Unwinding</h3><table id="unwT"></table></div>
+</div>
 <script>
-let interval="5";
-const chart=LightweightCharts.createChart(document.getElementById('chart'),{
+let interval="5", oiRows=[], showOI=true;
+const box=document.getElementById('chart');
+const chart=LightweightCharts.createChart(box,{
  layout:{background:{color:'#0f1115'},textColor:'#cbd5e1'},
  grid:{vertLines:{color:'#1a1e26'},horzLines:{color:'#1a1e26'}},
  timeScale:{timeVisible:true,secondsVisible:false},
  rightPriceScale:{borderColor:'#333'}});
 const candle=chart.addCandlestickSeries({upColor:'#22c55e',downColor:'#ef4444',borderVisible:false,wickUpColor:'#22c55e',wickDownColor:'#ef4444'});
-const vwap=chart.addLineSeries({color:'#facc15',lineWidth:2,priceLineVisible:false});
-const e20=chart.addLineSeries({color:'#38bdf8',lineWidth:1,priceLineVisible:false});
-const e50=chart.addLineSeries({color:'#fb923c',lineWidth:1,priceLineVisible:false});
 const vol=chart.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'v'});
-chart.priceScale('v').applyOptions({scaleMargins:{top:0.82,bottom:0}});
-new ResizeObserver(()=>chart.applyOptions({width:document.getElementById('chart').clientWidth})).observe(document.getElementById('chart'));
+chart.priceScale('v').applyOptions({scaleMargins:{top:0.85,bottom:0}});
+new ResizeObserver(()=>chart.applyOptions({width:box.clientWidth,height:box.clientHeight})).observe(box);
+
+const cv=document.getElementById('ov'),ctx=cv.getContext('2d');
+const fmt=n=>{const a=Math.abs(n);return a>=1e5?(n/1e5).toFixed(2)+'L':(n/1e3).toFixed(0)+'K'};
+const pc=(a,b)=>b?(a-b)/b*100:0;
+
+function draw(){
+ const w=box.clientWidth,h=box.clientHeight,dpr=window.devicePixelRatio||1;
+ if(cv.width!==Math.round(w*dpr)||cv.height!==Math.round(h*dpr)){
+  cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr);cv.style.width=w+'px';cv.style.height=h+'px';}
+ ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+ if(showOI&&oiRows.length){
+  let psw=70;try{psw=chart.priceScale('right').width()||70}catch(e){}
+  const right=w-psw-2,maxW=w*0.38;
+  const mx=Math.max(...oiRows.map(r=>Math.max(r.ce_oi,r.pe_oi)))||1;
+  const top=[...oiRows].sort((a,b)=>Math.max(b.ce_oi,b.pe_oi)-Math.max(a.ce_oi,a.pe_oi)).slice(0,8).map(r=>r.strike);
+  ctx.font='11px system-ui';ctx.textBaseline='middle';
+  for(const r of oiRows){
+   const y=candle.priceToCoordinate(r.strike),y2=candle.priceToCoordinate(r.strike+50);
+   if(y==null||y2==null||y<0||y>h)continue;
+   const bh=Math.max(2,Math.abs(y-y2)/2-1);
+   const cw=r.ce_oi/mx*maxW,pw=r.pe_oi/mx*maxW;
+   ctx.fillStyle='rgba(239,68,68,0.55)';ctx.fillRect(right-cw,y-bh,cw,bh);
+   ctx.fillStyle='rgba(34,197,94,0.55)';ctx.fillRect(right-pw,y,pw,bh);
+   if(top.includes(r.strike)){
+    const ceBig=r.ce_oi>=r.pe_oi;
+    const p=ceBig?pc(r.ce_oi,r.ce_prev):pc(r.pe_oi,r.pe_prev);
+    const wd=ceBig?cw:pw;
+    ctx.fillStyle=ceBig?'#fca5a5':'#86efac';ctx.textAlign='right';
+    ctx.fillText(`${r.strike} ${p>=0?'+':''}${p.toFixed(0)}%`,right-wd-4,ceBig?y-bh/2:y+bh/2);
+   }
+  }
+ }
+ requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
 
 async function loadCandles(){
  const days=interval==="D"?250:(interval==="60"?30:5);
@@ -233,30 +306,46 @@ async function loadCandles(){
  if(d.error){document.getElementById('err').textContent=d.error;return}
  document.getElementById('err').textContent='';
  candle.setData(d.map(c=>({time:c.time,open:c.open,high:c.high,low:c.low,close:c.close})));
- vwap.setData(interval==="D"?[]:d.map(c=>({time:c.time,value:c.vwap})));
- e20.setData(d.map(c=>({time:c.time,value:c.ema20})));
- e50.setData(d.map(c=>({time:c.time,value:c.ema50})));
  vol.setData(d.map(c=>({time:c.time,value:c.volume,color:c.close>=c.open?'#22c55e55':'#ef444455'})));
- const last=d[d.length-1],prev=d[d.length-2]||last;
- const ch=last.close-prev.close;
+ const last=d[d.length-1],prev=d[d.length-2]||last,ch=last.close-prev.close;
  document.getElementById('px').innerHTML=`<b>${last.close.toFixed(2)}</b> <span style="color:${ch>=0?'#22c55e':'#ef4444'}">${ch>=0?'+':''}${ch.toFixed(2)}</span>`;
 }
-let oiChart;
+
+function rowsHtml(list){
+ if(!list.length)return '<tr><td class="dim">No data yet</td></tr>';
+ return '<tr><th>Time</th><th>Strike</th><th>Change</th><th>%</th></tr>'+list.map(x=>
+  `<tr><td class="dim">${x.time}</td><td>${x.strike} <span class="${x.side==='CE'?'ce':'pe'}">${x.side}</span></td>`+
+  `<td>${x.delta>0?'+':''}${fmt(x.delta)}</td><td class="${x.delta>0?'pe':'ce'}">${x.pct>0?'+':''}${x.pct.toFixed(1)}%</td></tr>`).join('');
+}
+
 async function loadOI(){
  const r=await fetch('/api/oi');const d=await r.json();
  if(d.error){return}
+ oiRows=d.rows;
  document.getElementById('stats').innerHTML=
   [['Spot',d.spot.toFixed(2)],['PCR',d.pcr],['Max Pain',d.max_pain],['Support (PE OI)',d.support],['Resistance (CE OI)',d.resistance],['Expiry',d.expiry]]
   .map(x=>`<div class="card"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
- const labels=d.rows.map(x=>x.strike);
- const data={labels,datasets:[
-  {label:'Call OI',data:d.rows.map(x=>x.ce_oi),backgroundColor:'#ef4444'},
-  {label:'Put OI',data:d.rows.map(x=>x.pe_oi),backgroundColor:'#22c55e'}]};
- if(oiChart){oiChart.data=data;oiChart.update()}
- else oiChart=new Chart(document.getElementById('oiChart'),{type:'bar',data,
-  options:{maintainAspectRatio:false,plugins:{legend:{labels:{color:'#cbd5e1'}}},
-  scales:{x:{ticks:{color:'#8b93a1'}},y:{ticks:{color:'#8b93a1'}}}}});
+ // live events (time-stamped) first, then fill with change vs previous day
+ const day=[];
+ for(const x of d.rows){
+  for(const [side,n,p] of [['CE',x.ce_oi,x.ce_prev],['PE',x.pe_oi,x.pe_prev]]){
+   if(p>0&&n!==p)day.push({time:'vs prev day',strike:x.strike,side,delta:n-p,pct:pc(n,p)});
+  }
+ }
+ const live=d.events;
+ const add=live.filter(e=>e.type==='add').slice(0,6);
+ const unw=live.filter(e=>e.type==='unwind').slice(0,6);
+ const fill=(arr,dir)=>{
+  const extra=day.filter(e=>dir>0?e.delta>0:e.delta<0)
+   .sort((a,b)=>dir>0?b.pct-a.pct:a.pct-b.pct)
+   .filter(e=>!arr.some(a=>a.strike===e.strike&&a.side===e.side));
+  return arr.concat(extra.slice(0,Math.max(0,6-arr.length)));
+ };
+ document.getElementById('addT').innerHTML=rowsHtml(fill(add,1));
+ document.getElementById('unwT').innerHTML=rowsHtml(fill(unw,-1));
 }
+
+document.getElementById('oiBtn').onclick=e=>{showOI=!showOI;e.target.classList.toggle('on',showOI);};
 document.querySelectorAll('button[data-i]').forEach(b=>b.onclick=()=>{
  document.querySelectorAll('button[data-i]').forEach(x=>x.classList.remove('on'));
  b.classList.add('on');interval=b.dataset.i;loadCandles();});
