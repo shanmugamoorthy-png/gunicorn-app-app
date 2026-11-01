@@ -267,8 +267,6 @@ const chart=LightweightCharts.createChart(box,{
  timeScale:{timeVisible:true,secondsVisible:false},
  rightPriceScale:{borderColor:'#333'}});
 const candle=chart.addCandlestickSeries({upColor:'#22c55e',downColor:'#ef4444',borderVisible:false,wickUpColor:'#22c55e',wickDownColor:'#ef4444'});
-const vol=chart.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'v'});
-chart.priceScale('v').applyOptions({scaleMargins:{top:0.85,bottom:0}});
 new ResizeObserver(()=>chart.applyOptions({width:box.clientWidth,height:box.clientHeight})).observe(box);
 
 const cv=document.getElementById('ov'),ctx=cv.getContext('2d');
@@ -302,7 +300,7 @@ function draw(){
   };
   for(const r of oiRows){
    const y=candle.priceToCoordinate(r.strike),y2=candle.priceToCoordinate(r.strike+50);
-   if(y==null||y2==null||y<0||y>h)continue;
+   if(y==null||y2==null||y<4||y>h-34)continue;  // stay inside the plot, above the time axis
    const bh=Math.max(2,Math.abs(y-y2)/2-1);
    const cv_=ceV(r),pv_=peV(r);
    const cw=Math.abs(cv_)/mx*maxW,pw=Math.abs(pv_)/mx*maxW;
@@ -329,7 +327,6 @@ async function loadCandles(){
  document.getElementById('err').textContent='';
  candles=d;
  candle.setData(d.map(c=>({time:c.time,open:c.open,high:c.high,low:c.low,close:c.close})));
- vol.setData(d.map(c=>({time:c.time,value:c.volume,color:c.close>=c.open?'#22c55e55':'#ef444455'})));
  const last=d[d.length-1],prev=d[d.length-2]||last,ch=last.close-prev.close;
  document.getElementById('px').innerHTML=`<b>${last.close.toFixed(2)}</b> <span style="color:${ch>=0?'#22c55e':'#ef4444'}">${ch>=0?'+':''}${ch.toFixed(2)}</span>`;
  renderAlerts();
