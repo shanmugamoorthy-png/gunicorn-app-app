@@ -13,17 +13,18 @@ CLIENT_ID = os.environ.get("DHAN_CLIENT_ID", "")
 ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "")
 BASE = "https://api.dhan.co/v2"
 IST = timezone(timedelta(hours=5, minutes=30))
-
-NIFTY_ID = "13"  # NIFTY 50 index security id
 SEGMENT = "IDX_I"
 
-# OI change tracking (in memory)
-MIN_PCT = 2.0        # log a change only if >= 2% vs baseline
-MIN_ABS = 20000      # and at least this many contracts
-BASE_AGE = 300       # compare against snapshot ~5 min old
-_hist = deque()      # (timestamp, {strike: (ce_oi, pe_oi)})
-_events = []
-_last_logged = {}
+SYMBOLS = {
+    "NIFTY": {"id": "13", "name": "NIFTY 50", "step": 50, "span": 1000, "min_abs": 20000},
+    "BANKNIFTY": {"id": "25", "name": "BANK NIFTY", "step": 100, "span": 2500, "min_abs": 5000},
+    "SENSEX": {"id": "51", "name": "SENSEX", "step": 100, "span": 3000, "min_abs": 3000},
+}
+
+# OI change tracking (in memory, per symbol + expiry)
+MIN_PCT = 2.0     # log a change only if >= 2% vs baseline
+BASE_AGE = 300    # compare against snapshot ~5 min old
+_state = {}
 _lock = threading.Lock()
 _cache = {}
 
@@ -47,12 +48,40 @@ def cached(key, ttl, fn):
     return val
 
 
-def fetch_candles(interval, days):
+def err_json(e):
+    """Turn an exception into a short, readable message for the page."""
+    code, msg = "error", str(e)[:250]
+    if not CLIENT_ID or not ACCESS_TOKEN:
+        code = "token"
+        msg = "Dhan keys are missing. Add DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in Render > Environment."
+    elif isinstance(e, requests.HTTPError) and e.response is not None:
+        s = e.response.status_code
+        if s in (401, 403):
+            code = "token"
+            msg = ("Dhan token expired or invalid. Generate a new token and update "
+                   "DHAN_ACCESS_TOKEN in Render > Environment, then redeploy.")
+        elif s == 429:
+            code = "rate"
+            msg = "Dhan rate limit reached. Wait a few seconds; the page retries by itself."
+        else:
+            msg = f"Dhan API error {s}: {e.response.text[:200]}"
+    elif isinstance(e, (requests.ConnectionError, requests.Timeout)):
+        code = "network"
+        msg = "Cannot reach the Dhan API right now."
+    return jsonify({"error": msg, "code": code}), 500
+
+
+def get_cfg():
+    sym = request.args.get("symbol", "NIFTY").upper()
+    return sym, SYMBOLS.get(sym, SYMBOLS["NIFTY"])
+
+
+def fetch_candles(cfg, interval, days):
     now = datetime.now(IST)
     if interval == "D":
         url = f"{BASE}/charts/historical"
         body = {
-            "securityId": NIFTY_ID,
+            "securityId": cfg["id"],
             "exchangeSegment": SEGMENT,
             "instrument": "INDEX",
             "expiryCode": 0,
@@ -62,7 +91,7 @@ def fetch_candles(interval, days):
     else:
         url = f"{BASE}/charts/intraday"
         body = {
-            "securityId": NIFTY_ID,
+            "securityId": cfg["id"],
             "exchangeSegment": SEGMENT,
             "instrument": "INDEX",
             "interval": interval,
@@ -82,21 +111,21 @@ def fetch_candles(interval, days):
                 "high": d["high"][i],
                 "low": d["low"][i],
                 "close": d["close"][i],
-                "volume": d["volume"][i] if d.get("volume") else 0,
             }
         )
     return out
 
 
-def track_changes(rows):
+def track_changes(key, rows, min_abs):
     """Compare current OI with a ~5 min old snapshot and log big adds/unwinds."""
     now = time.time()
     cur = {r["strike"]: (r["ce_oi"], r["pe_oi"]) for r in rows}
     with _lock:
+        st = _state.setdefault(key, {"hist": deque(), "events": [], "last": {}})
         base = None
-        for t, snap in _hist:
+        for t, snap in st["hist"]:
             if now - t >= BASE_AGE:
-                base = snap  # keep the newest snapshot that is old enough
+                base = snap  # newest snapshot that is old enough
         if base:
             stamp = datetime.now(IST).strftime("%H:%M")
             for strike, (ce, pe) in cur.items():
@@ -107,13 +136,13 @@ def track_changes(rows):
                         continue
                     delta = new - old
                     pct = delta / old * 100
-                    if abs(delta) < MIN_ABS or abs(pct) < MIN_PCT:
+                    if abs(delta) < min_abs or abs(pct) < MIN_PCT:
                         continue
-                    key = (strike, side)
-                    if now - _last_logged.get(key, 0) < BASE_AGE:
+                    k = (strike, side)
+                    if now - st["last"].get(k, 0) < BASE_AGE:
                         continue
-                    _last_logged[key] = now
-                    _events.insert(
+                    st["last"][k] = now
+                    st["events"].insert(
                         0,
                         {
                             "time": stamp,
@@ -124,24 +153,29 @@ def track_changes(rows):
                             "pct": round(pct, 1),
                         },
                     )
-            del _events[80:]
-        _hist.append((now, cur))
-        while _hist and now - _hist[0][0] > 900:
-            _hist.popleft()
-        return list(_events)
+            del st["events"][80:]
+        st["hist"].append((now, cur))
+        while st["hist"] and now - st["hist"][0][0] > 900:
+            st["hist"].popleft()
+        return list(st["events"])
 
 
-def fetch_option_chain():
+def get_expiries(cfg):
     r = requests.post(
         f"{BASE}/optionchain/expirylist",
-        json={"UnderlyingScrip": int(NIFTY_ID), "UnderlyingSeg": SEGMENT},
+        json={"UnderlyingScrip": int(cfg["id"]), "UnderlyingSeg": SEGMENT},
         headers=headers(), timeout=20,
     )
     r.raise_for_status()
-    expiry = r.json()["data"][0]
+    return r.json()["data"]
+
+
+def fetch_option_chain(symbol, cfg, expiry_req):
+    expiries = cached(("exp", symbol), 600, lambda: get_expiries(cfg))
+    expiry = expiry_req if expiry_req in expiries else expiries[0]
     r = requests.post(
         f"{BASE}/optionchain",
-        json={"UnderlyingScrip": int(NIFTY_ID), "UnderlyingSeg": SEGMENT, "Expiry": expiry},
+        json={"UnderlyingScrip": int(cfg["id"]), "UnderlyingSeg": SEGMENT, "Expiry": expiry},
         headers=headers(), timeout=20,
     )
     r.raise_for_status()
@@ -161,7 +195,7 @@ def fetch_option_chain():
         )
     rows.sort(key=lambda x: x["strike"])
     atm = min(rows, key=lambda x: abs(x["strike"] - spot))["strike"]
-    rows = [x for x in rows if abs(x["strike"] - atm) <= 1000]
+    rows = [x for x in rows if abs(x["strike"] - atm) <= cfg["span"]]
 
     tot_ce = sum(x["ce_oi"] for x in rows)
     tot_pe = sum(x["pe_oi"] for x in rows)
@@ -174,9 +208,11 @@ def fetch_option_chain():
         if best is None or pain < best:
             best, pain_strike = pain, s["strike"]
 
-    events = track_changes(rows)
+    events = track_changes((symbol, expiry), rows, cfg["min_abs"])
     return {
-        "expiry": expiry, "spot": spot, "pcr": pcr, "max_pain": pain_strike,
+        "symbol": symbol, "name": cfg["name"], "step": cfg["step"],
+        "expiry": expiry, "expiries": expiries[:6],
+        "spot": spot, "pcr": pcr, "max_pain": pain_strike,
         "support": max(rows, key=lambda x: x["pe_oi"])["strike"],
         "resistance": max(rows, key=lambda x: x["ce_oi"])["strike"],
         "rows": rows,
@@ -186,20 +222,25 @@ def fetch_option_chain():
 
 @app.route("/api/candles")
 def api_candles():
+    symbol, cfg = get_cfg()
     interval = request.args.get("interval", "5")
     days = int(request.args.get("days", 5))
     try:
-        return jsonify(cached(("c", interval, days), 15, lambda: fetch_candles(interval, days)))
+        return jsonify(cached(("c", symbol, interval, days), 15,
+                              lambda: fetch_candles(cfg, interval, days)))
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return err_json(e)
 
 
 @app.route("/api/oi")
 def api_oi():
+    symbol, cfg = get_cfg()
+    expiry = request.args.get("expiry", "")
     try:
-        return jsonify(cached("oi", 30, fetch_option_chain))  # API limit: 1 req / 3s
+        return jsonify(cached(("oi", symbol, expiry), 30,   # API limit: 1 req / 3s
+                              lambda: fetch_option_chain(symbol, cfg, expiry)))
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return err_json(e)
 
 
 @app.route("/health")
@@ -211,12 +252,12 @@ PAGE = """
 <!doctype html>
 <html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Nifty OI Profile</title>
+<title>Index OI Profile</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
  body{margin:0;background:#0f1115;color:#e6e6e6;font-family:system-ui,sans-serif}
  header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid #222}
- button{background:#1b1f27;color:#ddd;border:1px solid #333;padding:6px 12px;border-radius:6px}
+ button,select{background:#1b1f27;color:#ddd;border:1px solid #333;padding:6px 12px;border-radius:6px;font-size:14px}
  button.on{background:#4f46e5;border-color:#4f46e5}
  #wrap{position:relative;height:62vh;min-height:360px}
  #chart{position:absolute;inset:0}
@@ -226,7 +267,7 @@ PAGE = """
  .card b{display:block;font-size:18px}
  .card span{font-size:12px;color:#8b93a1}
  .legend{font-size:12px;color:#8b93a1;padding:4px 14px}
- #err{color:#f87171;padding:6px 14px}
+ #err{display:none;margin:8px 14px 0;padding:8px 12px;border-radius:8px;background:#3b1212;border:1px solid #7f1d1d;color:#fecaca;font-size:14px}
  .alerts{margin:6px 14px 0;background:#161a21;border:1px solid #262b35;border-radius:8px;padding:8px 12px}
  .alerts h3{margin:2px 0 6px;font-size:15px}
  .al{padding:6px 0;border-top:1px solid #222;font-size:13px;line-height:1.35}
@@ -241,7 +282,8 @@ PAGE = """
  .ce{color:#f87171}.pe{color:#4ade80}.dim{color:#8b93a1}
 </style></head><body>
 <header>
- <strong>NIFTY 50</strong>
+ <select id="symSel"><option value="NIFTY">NIFTY 50</option><option value="BANKNIFTY">BANK NIFTY</option><option value="SENSEX">SENSEX</option></select>
+ <select id="expSel"></select>
  <span id="px"></span>
  <span style="flex:1"></span>
  <button id="oiBtn" class="on">OI Profile</button>
@@ -259,7 +301,9 @@ PAGE = """
  <div class="tbl"><h3 class="ce">OI Unwinding</h3><table id="unwT"></table></div>
 </div>
 <script>
-let interval="5", oiRows=[], showOI=true, mode="tot", candles=[], lastD=null, lastDay=[];
+let symbol="NIFTY", expiry="", step=50, interval="5", oiRows=[], showOI=true, mode="tot",
+    candles=[], lastD=null, lastDay=[], needFit=false, lines=[];
+const errs={c:'',o:''};
 const box=document.getElementById('chart');
 const chart=LightweightCharts.createChart(box,{
  layout:{background:{color:'#0f1115'},textColor:'#cbd5e1'},
@@ -273,12 +317,26 @@ const cv=document.getElementById('ov'),ctx=cv.getContext('2d');
 const fmt=n=>{const a=Math.abs(n);return a>=1e5?(n/1e5).toFixed(2)+'L':(n/1e3).toFixed(0)+'K'};
 const pc=(a,b)=>b?(a-b)/b*100:0;
 
+function showErr(){
+ const el=document.getElementById('err');
+ const t=[...new Set([errs.c,errs.o].filter(Boolean))].join('  |  ');
+ el.textContent=t;el.style.display=t?'block':'none';
+}
+
 function legend(){
  document.getElementById('legend').textContent = mode==='tot'
-  ? 'OI profile (total): red = Call OI, green = Put OI. Label = strike and % change vs previous day.'
+  ? 'OI profile (total): red = Call OI, green = Put OI. Label = strike and % change vs previous day. Lines: Support, Resistance, Max Pain.'
   : 'OI change profile (vs prev day): right side = OI added, left side = OI unwound (minus %). Red = Calls, green = Puts.';
 }
 legend();
+
+function tag(txt,x,y,align,col){
+ ctx.textAlign=align;
+ const wd=ctx.measureText(txt).width;
+ const bx=align==='right'?x-wd-3:x-3;
+ ctx.fillStyle='rgba(15,17,21,0.78)';ctx.fillRect(bx,y-7,wd+6,14);
+ ctx.fillStyle=col;ctx.fillText(txt,x,y);
+}
 
 function draw(){
  const w=box.clientWidth,h=box.clientHeight,dpr=window.devicePixelRatio||1;
@@ -287,47 +345,42 @@ function draw(){
  ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
  if(showOI&&oiRows.length){
   let psw=70;try{psw=chart.priceScale('right').width()||70}catch(e){}
-  const right=w-psw-2,maxW=w*0.2;   // thinner bars
+  const right=w-psw-2,maxW=w*0.2;
   const ceV=r=>mode==='tot'?r.ce_oi:r.ce_oi-r.ce_prev;
   const peV=r=>mode==='tot'?r.pe_oi:r.pe_oi-r.pe_prev;
   const mx=Math.max(...oiRows.map(r=>Math.max(Math.abs(ceV(r)),Math.abs(peV(r)))))||1;
   const top=[...oiRows].sort((a,b)=>Math.max(Math.abs(ceV(b)),Math.abs(peV(b)))-Math.max(Math.abs(ceV(a)),Math.abs(peV(a)))).slice(0,6).map(r=>r.strike);
-  ctx.font='11px system-ui';ctx.textBaseline='middle';
-  const bar=(x,y,wd,hh,v,col)=>{
+  ctx.font='10px system-ui';ctx.textBaseline='middle';
+  const bar=(y,wd,hh,v,col)=>{
    if(wd<0.5)return;
-   if(mode==='tot'||v>=0){ctx.fillStyle=col+(mode==='tot'?'0.55)':'0.8)');ctx.fillRect(x,y,wd,hh);}
-   else{ // unwinding: drawn from the LEFT edge of the chart
+   if(mode==='tot'||v>=0){ctx.fillStyle=col+(mode==='tot'?'0.55)':'0.8)');ctx.fillRect(right-wd,y,wd,hh);}
+   else{ // unwinding: drawn from the LEFT edge
     ctx.fillStyle=col+'0.45)';ctx.fillRect(0,y,wd,hh);
     ctx.strokeStyle=col+'1)';ctx.lineWidth=1.2;ctx.strokeRect(0.6,y+0.6,wd-1.2,hh-1.2);}
   };
   for(const r of oiRows){
-   const y=candle.priceToCoordinate(r.strike),y2=candle.priceToCoordinate(r.strike+50);
-   if(y==null||y2==null||y<4||y>h-34)continue;  // stay inside the plot, above the time axis
+   const y=candle.priceToCoordinate(r.strike),y2=candle.priceToCoordinate(r.strike+step);
+   if(y==null||y2==null||y<4||y>h-34)continue;
    const bh=Math.max(2,Math.abs(y-y2)/2-1);
    const cv_=ceV(r),pv_=peV(r);
    const cw=Math.abs(cv_)/mx*maxW,pw=Math.abs(pv_)/mx*maxW;
-   bar(right-cw,y-bh,cw,bh,cv_,'rgba(239,68,68,');
-   bar(right-pw,y,pw,bh,pv_,'rgba(34,197,94,');
+   bar(y-bh,cw,bh,cv_,'rgba(239,68,68,');
+   bar(y,pw,bh,pv_,'rgba(34,197,94,');
    if(mode==='chg'){
-    // label every bar with its % change, so unwinding (negative %) is visible too
     if(Math.abs(y-y2)>=18){
-     ctx.font='10px system-ui';ctx.textAlign='right';
      for(const [side,wd,n,p0,yy,col] of [['CE',cw,r.ce_oi,r.ce_prev,y-bh/2,'#fca5a5'],['PE',pw,r.pe_oi,r.pe_prev,y+bh/2,'#86efac']]){
       const p=pc(n,p0);
       if(wd<2||Math.abs(p)<10)continue;
-      ctx.fillStyle=col;
       const txt=`${r.strike} ${side} ${p>=0?'+':''}${p.toFixed(0)}%`;
-      if(n<p0){ctx.textAlign='left';ctx.fillText(txt,wd+4,yy);ctx.textAlign='right';}  // unwinding label on the left
-      else ctx.fillText(txt,right-wd-4,yy);
+      if(n<p0)tag(txt,wd+4,yy,'left',col);
+      else tag(txt,right-wd-4,yy,'right',col);
      }
-     ctx.font='11px system-ui';
     }
    }else if(top.includes(r.strike)){
     const ceBig=Math.abs(cv_)>=Math.abs(pv_);
     const p=ceBig?pc(r.ce_oi,r.ce_prev):pc(r.pe_oi,r.pe_prev);
     const wd=ceBig?cw:pw;
-    ctx.fillStyle=ceBig?'#fca5a5':'#86efac';ctx.textAlign='right';
-    ctx.fillText(`${r.strike} ${p>=0?'+':''}${p.toFixed(0)}%`,right-wd-4,ceBig?y-bh/2:y+bh/2);
+    tag(`${r.strike} ${p>=0?'+':''}${p.toFixed(0)}%`,right-wd-4,ceBig?y-bh/2:y+bh/2,'right',ceBig?'#fca5a5':'#86efac');
    }
   }
  }
@@ -335,17 +388,26 @@ function draw(){
 }
 requestAnimationFrame(draw);
 
+function setLines(d){
+ lines.forEach(l=>{try{candle.removePriceLine(l)}catch(e){}});lines=[];
+ [[d.support,'#22c55e','Support'],[d.resistance,'#ef4444','Resistance'],[d.max_pain,'#facc15','Max Pain']].forEach(([p,c,t])=>{
+  lines.push(candle.createPriceLine({price:p,color:c,lineWidth:1,lineStyle:2,axisLabelVisible:true,title:t}));});
+}
+
 async function loadCandles(){
  const days=interval==="D"?250:(interval==="60"?30:5);
- const r=await fetch(`/api/candles?interval=${interval}&days=${days}`);
- const d=await r.json();
- if(d.error){document.getElementById('err').textContent=d.error;return}
- document.getElementById('err').textContent='';
- candles=d;
- candle.setData(d.map(c=>({time:c.time,open:c.open,high:c.high,low:c.low,close:c.close})));
- const last=d[d.length-1],prev=d[d.length-2]||last,ch=last.close-prev.close;
- document.getElementById('px').innerHTML=`<b>${last.close.toFixed(2)}</b> <span style="color:${ch>=0?'#22c55e':'#ef4444'}">${ch>=0?'+':''}${ch.toFixed(2)}</span>`;
- renderAlerts();
+ try{
+  const r=await fetch(`/api/candles?symbol=${symbol}&interval=${interval}&days=${days}`);
+  const d=await r.json();
+  if(d.error){errs.c=d.error;showErr();return}
+  errs.c='';showErr();
+  candles=d;
+  candle.setData(d.map(c=>({time:c.time,open:c.open,high:c.high,low:c.low,close:c.close})));
+  if(needFit){chart.timeScale().fitContent();needFit=false;}
+  const last=d[d.length-1],prev=d[d.length-2]||last,ch=last.close-prev.close;
+  document.getElementById('px').innerHTML=`<b>${last.close.toFixed(2)}</b> <span style="color:${ch>=0?'#22c55e':'#ef4444'}">${ch>=0?'+':''}${ch.toFixed(2)}</span>`;
+  renderAlerts();
+ }catch(e){errs.c='Cannot reach the server.';showErr();}
 }
 
 function rowsHtml(list){
@@ -367,7 +429,7 @@ function renderAlerts(){
  const pool=lastD.events.map(e=>({...e,src:'live'})).concat(lastDay.filter(e=>Math.abs(e.pct)>=15).map(e=>({...e,src:'day'})));
  const sig=[];
  for(const e of pool){
-  if(Math.abs(e.strike-spot)>300)continue;
+  if(Math.abs(e.strike-spot)>step*6)continue;
   let s=null;
   if(dir==='up'&&e.side==='CE'&&e.delta<0)s=['Short covering','bull','Call OI unwinding while price rises'];
   else if(dir==='up'&&e.side==='PE'&&e.delta>0)s=['Put writing support','bull','Put OI building while price rises'];
@@ -385,33 +447,46 @@ function renderAlerts(){
 }
 
 async function loadOI(){
- const r=await fetch('/api/oi');const d=await r.json();
- if(d.error){return}
- oiRows=d.rows;lastD=d;
- document.getElementById('stats').innerHTML=
-  [['Spot',d.spot.toFixed(2)],['PCR',d.pcr],['Max Pain',d.max_pain],['Support (PE OI)',d.support],['Resistance (CE OI)',d.resistance],['Expiry',d.expiry]]
-  .map(x=>`<div class="card"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
- const day=[];
- for(const x of d.rows){
-  for(const [side,n,p] of [['CE',x.ce_oi,x.ce_prev],['PE',x.pe_oi,x.pe_prev]]){
-   if(p>0&&n!==p)day.push({time:'vs prev day',strike:x.strike,side,delta:n-p,pct:pc(n,p)});
+ try{
+  const r=await fetch(`/api/oi?symbol=${symbol}&expiry=${expiry}`);
+  const d=await r.json();
+  if(d.error){errs.o=d.error;showErr();return}
+  errs.o='';showErr();
+  oiRows=d.rows;lastD=d;step=d.step;
+  const sel=document.getElementById('expSel');
+  sel.innerHTML=d.expiries.map(x=>`<option value="${x}"${x===d.expiry?' selected':''}>Exp ${x}</option>`).join('');
+  setLines(d);
+  document.getElementById('stats').innerHTML=
+   [['Spot',d.spot.toFixed(2)],['PCR',d.pcr],['Max Pain',d.max_pain],['Support (PE OI)',d.support],['Resistance (CE OI)',d.resistance],['Expiry',d.expiry]]
+   .map(x=>`<div class="card"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
+  const day=[];
+  for(const x of d.rows){
+   for(const [side,n,p] of [['CE',x.ce_oi,x.ce_prev],['PE',x.pe_oi,x.pe_prev]]){
+    if(p>0&&n!==p)day.push({time:'vs prev day',strike:x.strike,side,delta:n-p,pct:pc(n,p)});
+   }
   }
- }
- lastDay=day;
- const live=d.events;
- const add=live.filter(e=>e.type==='add').slice(0,6);
- const unw=live.filter(e=>e.type==='unwind').slice(0,6);
- const fill=(arr,dir)=>{
-  const extra=day.filter(e=>dir>0?e.delta>0:e.delta<0)
-   .sort((a,b)=>dir>0?b.pct-a.pct:a.pct-b.pct)
-   .filter(e=>!arr.some(a=>a.strike===e.strike&&a.side===e.side));
-  return arr.concat(extra.slice(0,Math.max(0,6-arr.length)));
- };
- document.getElementById('addT').innerHTML=rowsHtml(fill(add,1));
- document.getElementById('unwT').innerHTML=rowsHtml(fill(unw,-1));
- renderAlerts();
+  lastDay=day;
+  const live=d.events;
+  const add=live.filter(e=>e.type==='add').slice(0,6);
+  const unw=live.filter(e=>e.type==='unwind').slice(0,6);
+  const fill=(arr,dir)=>{
+   const extra=day.filter(e=>dir>0?e.delta>0:e.delta<0)
+    .sort((a,b)=>dir>0?b.pct-a.pct:a.pct-b.pct)
+    .filter(e=>!arr.some(a=>a.strike===e.strike&&a.side===e.side));
+   return arr.concat(extra.slice(0,Math.max(0,6-arr.length)));
+  };
+  document.getElementById('addT').innerHTML=rowsHtml(fill(add,1));
+  document.getElementById('unwT').innerHTML=rowsHtml(fill(unw,-1));
+  renderAlerts();
+ }catch(e){errs.o='Cannot reach the server.';showErr();}
 }
 
+document.getElementById('symSel').onchange=e=>{
+ symbol=e.target.value;expiry='';oiRows=[];lastD=null;lastDay=[];candles=[];
+ lines.forEach(l=>{try{candle.removePriceLine(l)}catch(x){}});lines=[];
+ document.getElementById('alerts').textContent='Loading...';
+ needFit=true;loadCandles();loadOI();};
+document.getElementById('expSel').onchange=e=>{expiry=e.target.value;loadOI();};
 document.getElementById('oiBtn').onclick=e=>{showOI=!showOI;e.target.classList.toggle('on',showOI);};
 document.getElementById('modeBtn').onclick=e=>{
  mode=mode==='tot'?'chg':'tot';
