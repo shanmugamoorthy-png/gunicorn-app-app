@@ -276,7 +276,7 @@ const pc=(a,b)=>b?(a-b)/b*100:0;
 function legend(){
  document.getElementById('legend').textContent = mode==='tot'
   ? 'OI profile (total): red = Call OI, green = Put OI. Label = strike and % change vs previous day.'
-  : 'OI change profile (vs prev day): filled bar = OI added, outlined bar = OI unwound. Red = Calls, green = Puts. Labels: strike, side and % (minus = unwinding).';
+  : 'OI change profile (vs prev day): right side = OI added, left side = OI unwound (minus %). Red = Calls, green = Puts.';
 }
 legend();
 
@@ -296,7 +296,9 @@ function draw(){
   const bar=(x,y,wd,hh,v,col)=>{
    if(wd<0.5)return;
    if(mode==='tot'||v>=0){ctx.fillStyle=col+(mode==='tot'?'0.55)':'0.8)');ctx.fillRect(x,y,wd,hh);}
-   else{ctx.strokeStyle=col+'1)';ctx.lineWidth=1.2;ctx.strokeRect(x+0.6,y+0.6,wd-1.2,hh-1.2);}
+   else{ // unwinding: drawn from the LEFT edge of the chart
+    ctx.fillStyle=col+'0.45)';ctx.fillRect(0,y,wd,hh);
+    ctx.strokeStyle=col+'1)';ctx.lineWidth=1.2;ctx.strokeRect(0.6,y+0.6,wd-1.2,hh-1.2);}
   };
   for(const r of oiRows){
    const y=candle.priceToCoordinate(r.strike),y2=candle.priceToCoordinate(r.strike+50);
@@ -314,7 +316,9 @@ function draw(){
       const p=pc(n,p0);
       if(wd<2||Math.abs(p)<10)continue;
       ctx.fillStyle=col;
-      ctx.fillText(`${r.strike} ${side} ${p>=0?'+':''}${p.toFixed(0)}%`,right-wd-4,yy);
+      const txt=`${r.strike} ${side} ${p>=0?'+':''}${p.toFixed(0)}%`;
+      if(n<p0){ctx.textAlign='left';ctx.fillText(txt,wd+4,yy);ctx.textAlign='right';}  // unwinding label on the left
+      else ctx.fillText(txt,right-wd-4,yy);
      }
      ctx.font='11px system-ui';
     }
