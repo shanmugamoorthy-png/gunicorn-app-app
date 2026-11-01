@@ -146,6 +146,7 @@ def track_changes(key, rows, min_abs):
                         0,
                         {
                             "time": stamp,
+                            "ts": int(now),
                             "strike": strike,
                             "side": side,
                             "type": "add" if delta > 0 else "unwind",
@@ -295,6 +296,7 @@ PAGE = """
 <div id="wrap"><div id="chart"></div><canvas id="ov"></canvas></div>
 <div class="legend" id="legend"></div>
 <div class="stats" id="stats"></div>
+<div class="alerts"><h3>Direction: Option OI Unwinding</h3><div id="dir" class="dim">Loading...</div></div>
 <div class="alerts"><h3>Alerts: OI vs Price</h3><div id="alerts" class="dim">Loading...</div></div>
 <div class="tables">
  <div class="tbl"><h3 class="pe">OI Addition</h3><table id="addT"></table></div>
@@ -408,7 +410,7 @@ async function loadCandles(){
   if(needFit){chart.timeScale().fitContent();needFit=false;}
   const last=d[d.length-1],prev=d[d.length-2]||last,ch=last.close-prev.close;
   document.getElementById('px').innerHTML=`<b>${last.close.toFixed(2)}</b> <span style="color:${ch>=0?'#22c55e':'#ef4444'}">${ch>=0?'+':''}${ch.toFixed(2)}</span>`;
-  renderAlerts();
+  renderAlerts();renderDir();
  }catch(e){errs.c='Cannot reach the server.';showErr();}
 }
 
@@ -448,6 +450,59 @@ function renderAlerts(){
   :'<div class="al dim">No OI change near spot confirms this move yet.</div>');
 }
 
+function unwindScore(list){
+ let c=0,p=0;const parts=[];
+ for(const e of list){
+  const w=Math.max(0,1-Math.abs(e.strike-lastD.spot)/(step*10));  // strikes near spot count more
+  if(!w)continue;
+  const v=-e.delta*w;
+  if(e.side==='CE')c+=v;else p+=v;
+  parts.push({...e,v});
+ }
+ const t=c+p;
+ return {c,p,total:t,score:t?(c-p)/t:0,parts:parts.sort((a,b)=>b.v-a.v).slice(0,3)};
+}
+function lbl(s){
+ if(s.total<=0)return ['No unwinding','dim'];
+ if(s.score>=0.25)return ['Bullish','bull'];
+ if(s.score<=-0.25)return ['Bearish','bear'];
+ return ['Mixed','dim'];
+}
+function gauge(s){
+ const pos=((s.score+1)/2*100).toFixed(0);
+ return `<div style="position:relative;height:10px;border-radius:5px;margin:8px 0 6px;background:linear-gradient(90deg,#ef4444,#374151 50%,#22c55e)"><div style="position:absolute;top:-3px;left:calc(${pos}% - 2px);width:4px;height:16px;background:#fff;border-radius:2px"></div></div>`;
+}
+function dirBlock(title,s){
+ const [t,c]=lbl(s);
+ const parts=s.parts.map(x=>`${x.strike} ${x.side} ${x.pct>0?'+':''}${x.pct.toFixed(0)}%`).join(', ');
+ return `<div class="al"><b>${title}: <span class="${c}">${t}</span></b> `+
+  `<span class="dim">(score ${s.score>=0?'+':''}${s.score.toFixed(2)})</span>${s.total>0?gauge(s):''}`+
+  `<div class="dim">Call unwinding ${fmt(s.c)} (bullish) vs Put unwinding ${fmt(s.p)} (bearish)`+(parts?` | Top: ${parts}`:'')+`</div></div>`;
+}
+function renderDir(){
+ const el=document.getElementById('dir');
+ if(!lastD){el.textContent='Loading...';return}
+ const nowS=Date.now()/1000;
+ const live=unwindScore(lastD.events.filter(e=>e.type==='unwind'&&e.ts>=nowS-1800));
+ const day=unwindScore(lastDay.filter(e=>e.delta<0));
+ const sd=spotDir();
+ let conf='';
+ const main=live.total>0?live:day;
+ if(sd&&main.total>0&&Math.abs(main.score)>=0.25){
+  const bull=main.score>0;
+  if(sd.dir==='flat')conf='Spot is flat, so wait for price to confirm.';
+  else if((bull&&sd.dir==='up')||(!bull&&sd.dir==='down'))conf=`Spot is ${sd.dir==='up'?'rising':'falling'}: confirms the ${bull?'bullish':'bearish'} unwinding.`;
+  else conf=`Warning: spot is ${sd.dir==='up'?'rising':'falling'} against the ${bull?'bullish':'bearish'} unwinding (diverging).`;
+ }
+ el.innerHTML=dirBlock('Live (last 30 min)',live)+dirBlock('Day (vs prev day)',day)+(conf?`<div class="al">${conf}</div>`:'')+
+  '<div class="al dim">Call unwinding = short covering (bullish). Put unwinding = long unwinding (bearish). Strikes near spot count more. OI additions are ignored. Live needs about 5 minutes of data.</div>';
+}
+function spotDir(){
+ if(candles.length<5)return null;
+ const n=candles.length,mv=pc(candles[n-1].close,candles[n-4].close);
+ return {mv,dir:mv>0.03?'up':(mv<-0.03?'down':'flat')};
+}
+
 async function loadOI(){
  try{
   const r=await fetch(`/api/oi?symbol=${symbol}&expiry=${expiry}`);
@@ -479,7 +534,7 @@ async function loadOI(){
   };
   document.getElementById('addT').innerHTML=rowsHtml(fill(add,1));
   document.getElementById('unwT').innerHTML=rowsHtml(fill(unw,-1));
-  renderAlerts();
+  renderAlerts();renderDir();
  }catch(e){errs.o='Cannot reach the server.';showErr();}
 }
 
@@ -487,6 +542,7 @@ document.getElementById('symSel').onchange=e=>{
  symbol=e.target.value;expiry=savedExp();oiRows=[];lastD=null;lastDay=[];candles=[];
  lines.forEach(l=>{try{candle.removePriceLine(l)}catch(x){}});lines=[];
  document.getElementById('alerts').textContent='Loading...';
+ renderDir();
  needFit=true;loadCandles();loadOI();};
 document.getElementById('expSel').onchange=e=>{
  expiry=e.target.value;
@@ -501,7 +557,7 @@ document.querySelectorAll('button[data-i]').forEach(b=>b.onclick=()=>{
  document.querySelectorAll('button[data-i]').forEach(x=>x.classList.remove('on'));
  b.classList.add('on');interval=b.dataset.i;loadCandles();});
 loadCandles();loadOI();
-setInterval(loadCandles,15000);setInterval(loadOI,60000);
+setInterval(loadCandles,15000);setInterval(loadOI,60000);setInterval(renderDir,30000);
 </script></body></html>
 """
 
