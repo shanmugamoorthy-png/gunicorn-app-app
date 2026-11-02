@@ -361,6 +361,11 @@ function draw(){
   const big=r=>Math.max(mag(r,'CE'),mag(r,'PE'));
   const mx=Math.max(1,...oiRows.map(big));
   const top=[...oiRows].sort((a,b)=>big(b)-big(a)).slice(0,6).map(r=>r.strike);
+  if(mode!=='tot'&&mx<=1){  // nothing to draw: OI has not changed vs previous day (pre-market / market just closed)
+   ctx.font='13px system-ui';ctx.textBaseline='middle';ctx.textAlign='center';
+   ctx.fillStyle='#8b93a1';
+   ctx.fillText('No '+(mode==='add'?'OI added':'OI unwinding')+' yet. Shows after the market opens (9:15 AM).',w/2,h/2);
+  }
   ctx.font='10px system-ui';ctx.textBaseline='middle';
   const bar=(y,wd,hh,col)=>{
    if(wd<0.5)return;
