@@ -287,8 +287,9 @@ PAGE = """
  <select id="expSel"></select>
  <span id="px"></span>
  <span style="flex:1"></span>
- <button id="oiBtn" class="on">OI Profile</button>
- <button id="modeBtn">Total OI</button>
+ <button data-m="tot" class="on">OI Profile</button>
+ <button data-m="add">OI Change</button>
+ <button data-m="unw">Unwinding</button>
  <button data-i="1">1m</button><button data-i="5" class="on">5m</button>
  <button data-i="15">15m</button><button data-i="60">1h</button><button data-i="D">1D</button>
 </header>
@@ -328,9 +329,11 @@ function showErr(){
 }
 
 function legend(){
- document.getElementById('legend').textContent = mode==='tot'
-  ? 'OI profile (total): red = Call OI, green = Put OI. Label = strike and % change vs previous day. Lines: Support, Resistance, Max Pain.'
-  : 'OI change profile (vs prev day): right side = OI added, left side = OI unwound (minus %). Red = Calls, green = Puts.';
+ const t={
+  tot:'OI profile (total OI in millions): red = Call OI, green = Put OI. Lines: Support, Resistance, Max Pain.',
+  add:'OI change profile: only OI added vs previous day, with % change. Red = Calls, green = Puts.',
+  unw:'OI unwinding profile: only OI unwound vs previous day, drawn from the left, with % change (minus). Red = Calls, green = Puts.'};
+ document.getElementById('legend').textContent=showOI?t[mode]:'OI profile hidden. Tap OI Profile, OI Change or Unwinding to show it.';
 }
 legend();
 
@@ -350,41 +353,45 @@ function draw(){
  if(showOI&&oiRows.length){
   let psw=70;try{psw=chart.priceScale('right').width()||70}catch(e){}
   const right=w-psw-2,maxW=w*0.2;
-  const ceV=r=>mode==='tot'?r.ce_oi:r.ce_oi-r.ce_prev;
-  const peV=r=>mode==='tot'?r.pe_oi:r.pe_oi-r.pe_prev;
-  const mx=Math.max(...oiRows.map(r=>Math.max(Math.abs(ceV(r)),Math.abs(peV(r)))))||1;
-  const top=[...oiRows].sort((a,b)=>Math.max(Math.abs(ceV(b)),Math.abs(peV(b)))-Math.max(Math.abs(ceV(a)),Math.abs(peV(a)))).slice(0,6).map(r=>r.strike);
+  // bar size for this mode: total OI, OI added, or OI unwound (always a positive size)
+  const mag=(r,s)=>{
+   const n=s==='CE'?r.ce_oi:r.pe_oi,p=s==='CE'?r.ce_prev:r.pe_prev;
+   return mode==='tot'?n:(mode==='add'?Math.max(0,n-p):Math.max(0,p-n));
+  };
+  const big=r=>Math.max(mag(r,'CE'),mag(r,'PE'));
+  const mx=Math.max(1,...oiRows.map(big));
+  const top=[...oiRows].sort((a,b)=>big(b)-big(a)).slice(0,6).map(r=>r.strike);
   ctx.font='10px system-ui';ctx.textBaseline='middle';
-  const bar=(y,wd,hh,v,col)=>{
+  const bar=(y,wd,hh,col)=>{
    if(wd<0.5)return;
-   if(mode==='tot'||v>=0){ctx.fillStyle=col+(mode==='tot'?'0.55)':'0.8)');ctx.fillRect(right-wd,y,wd,hh);}
-   else{ // unwinding: drawn from the LEFT edge
+   if(mode==='unw'){ // unwinding: drawn from the LEFT edge
     ctx.fillStyle=col+'0.45)';ctx.fillRect(0,y,wd,hh);
-    ctx.strokeStyle=col+'1)';ctx.lineWidth=1.2;ctx.strokeRect(0.6,y+0.6,wd-1.2,hh-1.2);}
+    ctx.strokeStyle=col+'1)';ctx.lineWidth=1.2;ctx.strokeRect(0.6,y+0.6,wd-1.2,hh-1.2);
+   }else{
+    ctx.fillStyle=col+(mode==='tot'?'0.55)':'0.8)');ctx.fillRect(right-wd,y,wd,hh);
+   }
   };
   for(const r of oiRows){
    const y=candle.priceToCoordinate(r.strike),y2=candle.priceToCoordinate(r.strike+step);
    if(y==null||y2==null||y<4||y>h-34)continue;
    const bh=Math.max(2,Math.abs(y-y2)/2-1);
-   const cv_=ceV(r),pv_=peV(r);
-   const cw=Math.abs(cv_)/mx*maxW,pw=Math.abs(pv_)/mx*maxW;
-   bar(y-bh,cw,bh,cv_,'rgba(239,68,68,');
-   bar(y,pw,bh,pv_,'rgba(34,197,94,');
-   if(mode==='chg'){
-    if(Math.abs(y-y2)>=18){
-     for(const [side,wd,n,p0,yy,col] of [['CE',cw,r.ce_oi,r.ce_prev,y-bh/2,'#fca5a5'],['PE',pw,r.pe_oi,r.pe_prev,y+bh/2,'#86efac']]){
-      const p=pc(n,p0);
-      if(wd<2||Math.abs(p)<10)continue;
-      const txt=`${r.strike} ${side} ${p>=0?'+':''}${p.toFixed(0)}%`;
-      if(n<p0)tag(txt,wd+4,yy,'left',col);
-      else tag(txt,right-wd-4,yy,'right',col);
-     }
+   const cv_=mag(r,'CE'),pv_=mag(r,'PE');
+   const cw=cv_/mx*maxW,pw=pv_/mx*maxW;
+   bar(y-bh,cw,bh,'rgba(239,68,68,');
+   bar(y,pw,bh,'rgba(34,197,94,');
+   const roomy=Math.abs(y-y2)>=18;           // enough space to label every bar
+   if(!roomy&&!top.includes(r.strike))continue;
+   for(const [side,wd,n,p0,yy,col] of [['CE',cw,r.ce_oi,r.ce_prev,y-bh/2,'#fca5a5'],['PE',pw,r.pe_oi,r.pe_prev,y+bh/2,'#86efac']]){
+    if(wd<2)continue;
+    if(!roomy&&((side==='CE')!==(cv_>=pv_)))continue;   // crowded: label only the bigger side
+    let txt;
+    if(mode==='tot')txt=`${r.strike} ${side} ${(n/1e6).toFixed(2)}M`;
+    else{
+     const p=pc(n,p0);
+     if(Math.abs(p)<1)continue;
+     txt=`${r.strike} ${side} ${p>0?'+':''}${p.toFixed(0)}%`;
     }
-   }else if(top.includes(r.strike)){
-    const ceBig=Math.abs(cv_)>=Math.abs(pv_);
-    const p=ceBig?pc(r.ce_oi,r.ce_prev):pc(r.pe_oi,r.pe_prev);
-    const wd=ceBig?cw:pw;
-    tag(`${r.strike} ${p>=0?'+':''}${p.toFixed(0)}%`,right-wd-4,ceBig?y-bh/2:y+bh/2,'right',ceBig?'#fca5a5':'#86efac');
+    if(mode==='unw')tag(txt,wd+4,yy,'left',col);else tag(txt,right-wd-4,yy,'right',col);
    }
   }
  }
@@ -548,11 +555,12 @@ document.getElementById('expSel').onchange=e=>{
  expiry=e.target.value;
  try{localStorage.setItem('exp_'+symbol,expiry)}catch(x){}
  loadOI();};
-document.getElementById('oiBtn').onclick=e=>{showOI=!showOI;e.target.classList.toggle('on',showOI);};
-document.getElementById('modeBtn').onclick=e=>{
- mode=mode==='tot'?'chg':'tot';
- e.target.textContent=mode==='tot'?'Total OI':'OI Change';
- e.target.classList.toggle('on',mode==='chg');legend();};
+document.querySelectorAll('button[data-m]').forEach(b=>b.onclick=()=>{
+ const m=b.dataset.m;
+ if(showOI&&mode===m)showOI=false;      // tap the active button again to hide the profile
+ else{mode=m;showOI=true;}
+ document.querySelectorAll('button[data-m]').forEach(x=>x.classList.toggle('on',showOI&&x.dataset.m===mode));
+ legend();});
 document.querySelectorAll('button[data-i]').forEach(b=>b.onclick=()=>{
  document.querySelectorAll('button[data-i]').forEach(x=>x.classList.remove('on'));
  b.classList.add('on');interval=b.dataset.i;loadCandles();});
